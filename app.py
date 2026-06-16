@@ -22,11 +22,17 @@ DEFAULT_TICKERS = "AAPL, QQQ, SPY, 005930.KS, 000660.KS"
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 DEFAULT_PERIOD = "10y"
 DEFAULT_INTERVAL = "1d"
-DEFAULT_SENSITIVITIES = (0.03, 0.05, 0.08)
+DEFAULT_SENSITIVITIES = (0.03, 0.05, 0.08, 0.13)
 DEFAULT_ATR_MULTIPLE = 1.5
-MAX_PIVOTS = 80
-MAX_ANALYSIS_BARS = 2600
-TOP_SCENARIOS = 12
+MAX_PIVOTS = 140
+MAX_ANALYSIS_BARS = 4200
+TOP_SCENARIOS = 14
+RULE_PRICE_BUFFER_PCT = 0.025
+RULE_RATIO_BUFFER = 0.06
+TARGET_OVERSHOOT_BUFFER_PCT = 0.05
+TARGET_MAJOR_OVERSHOOT_PCT = 0.25
+TARGET_EXTREME_OVERSHOOT_PCT = 0.50
+LONG_TERM_WAVE_BARS = 1000
 DISCLAIMER = (
     "Research tool only. Elliott Wave counts are probabilistic rule scores, "
     "not investment advice or guaranteed forecasts."
@@ -57,6 +63,10 @@ class WaveCandidate:
     score_raw: float
     target: float | None
     invalidation: float | None
+    target_zone: tuple[float | None, float | None] = (None, None)
+    status: str = ""
+    current_wave: str = ""
+    next_wave: str = ""
     rule_hits: list[str] = field(default_factory=list)
     rule_misses: list[str] = field(default_factory=list)
     extension: str = ""
@@ -124,6 +134,29 @@ def direction_name(direction: int | str) -> str:
     return "Neutral"
 
 
+def direction_sign(direction: int | str) -> int:
+    if direction in (1, "up", "bullish", "Bullish"):
+        return 1
+    if direction in (-1, "down", "bearish", "Bearish"):
+        return -1
+    return 0
+
+
+def directional_move(direction: int | str, start: float, end: float) -> float:
+    sign = direction_sign(direction)
+    if sign == 0:
+        return 0.0
+    return sign * (float(end) - float(start))
+
+
+def sorted_price_zone(a: float | None, b: float | None) -> tuple[float | None, float | None]:
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return None, None
+    low = min(float(a), float(b))
+    high = max(float(a), float(b))
+    return low, high
+
+
 def nearest_fib_score(value: float, fibs: Iterable[float], tolerance: float = 0.18) -> tuple[float, float]:
     if value is None or pd.isna(value) or math.isinf(value):
         return 0.0, float("nan")
@@ -162,6 +195,15 @@ def format_price(value: float | None) -> str:
     if abs(float(value)) >= 1000:
         return f"{float(value):,.0f}"
     return f"{float(value):,.2f}"
+
+
+def format_zone(zone: tuple[float | None, float | None]) -> str:
+    low, high = zone
+    if low is None or high is None or pd.isna(low) or pd.isna(high):
+        return "-"
+    if abs(float(high) - float(low)) <= max(abs(float(high)) * 0.002, 1e-9):
+        return format_price(high)
+    return f"{format_price(low)} ~ {format_price(high)}"
 
 
 def price_move_pct(current: float, target: float | None, direction: str) -> float | None:
@@ -219,7 +261,12 @@ def build_korean_guide(analysis: TickerAnalysis, scenario: ScenarioScore) -> dic
     direction_text = direction_ko(candidate.direction)
     confidence_text = confidence_ko(scenario.confidence_pct)
 
-    if move_pct is None:
+    if "목표" in candidate.status and "초과" in candidate.status:
+        target_sentence = (
+            f"{candidate.status}. 기존 목표가를 단순한 반대 방향 압력으로 해석하지 말고, "
+            "연장파 또는 상위 파동 카운트 재검토를 우선합니다."
+        )
+    elif move_pct is None:
         target_sentence = "목표가 계산이 불안정해서 목표 구간은 표시하지 않습니다."
     elif candidate.direction == "Bullish":
         if move_pct > 0:
@@ -255,6 +302,10 @@ def build_korean_guide(analysis: TickerAnalysis, scenario: ScenarioScore) -> dic
     else:
         extension_sentence = "뚜렷한 연장파 신호는 약합니다."
 
+    forecast_sentence = "현재/다음 파동 전망이 아직 충분하지 않습니다."
+    if candidate.current_wave or candidate.next_wave:
+        forecast_sentence = f"현재 파동: {candidate.current_wave or '-'} / 다음 예상: {candidate.next_wave or '-'}"
+
     return {
         "headline": f"{analysis.ticker}는 현재 {pattern_ko}로 해석될 가능성이 가장 큽니다.",
         "state": f"방향은 {direction_text}, 종합 기술 확률은 {scenario.probability_pct:.1f}%입니다. 근거 점수는 {confidence_text}({scenario.confidence_pct:.1f}%)이고, 후보 내 비중은 {scenario.relative_weight_pct:.1f}%입니다.",
@@ -262,6 +313,7 @@ def build_korean_guide(analysis: TickerAnalysis, scenario: ScenarioScore) -> dic
         "risk": risk_sentence,
         "wave": state_sentence,
         "extension": extension_sentence,
+        "forecast": forecast_sentence,
         "indicator": "보조지표 확인: " + ", ".join(scenario.indicator_notes[:4]),
     }
 
@@ -593,6 +645,14 @@ def signed_swings(prices: list[float], direction: int) -> list[float]:
     return [direction * (prices[i + 1] - prices[i]) for i in range(len(prices) - 1)]
 
 
+def rule_price_buffer(prices: list[float]) -> float:
+    if not prices:
+        return 0.0
+    span = max(prices) - min(prices)
+    median_swing = float(np.median(swing_lengths(prices))) if len(prices) >= 2 else 0.0
+    return max(span * RULE_PRICE_BUFFER_PCT, median_swing * RULE_PRICE_BUFFER_PCT, 1e-9)
+
+
 def target_from_candidate(pattern: str, prices: list[float], direction: int) -> tuple[float | None, float | None]:
     current = prices[-1]
     if len(prices) >= 6 and ("Impulse" in pattern or "Diagonal" in pattern):
@@ -628,26 +688,43 @@ def validate_impulse(window: tuple[WavePivot, ...]) -> WaveCandidate | None:
     swings = signed_swings(prices, direction)
     hits: list[str] = []
     misses: list[str] = []
+    soft_penalty = 0.0
+    buffer = rule_price_buffer(prices)
 
     if not (swings[0] > 0 and swings[1] < 0 and swings[2] > 0 and swings[3] < 0 and swings[4] > 0):
         return None
     hits.append("Alternating 5-wave swing sequence")
 
-    if direction * (prices[2] - prices[0]) <= 0:
+    wave2_rule_distance = direction * (prices[2] - prices[0])
+    if wave2_rule_distance <= -buffer:
         misses.append("Wave 2 retraced more than 100% of wave 1")
         return None
-    hits.append("Wave 2 does not fully retrace wave 1")
+    if wave2_rule_distance <= 0:
+        misses.append("Wave 2 marginally breached wave 1 start within buffer")
+        soft_penalty += 6
+    else:
+        hits.append("Wave 2 does not fully retrace wave 1")
 
     actionary = [abs(swings[0]), abs(swings[2]), abs(swings[4])]
-    if actionary[1] <= min(actionary[0], actionary[2]):
+    shortest_limit = min(actionary[0], actionary[2])
+    if actionary[1] < shortest_limit * (1 - RULE_RATIO_BUFFER):
         misses.append("Wave 3 is the shortest actionary wave")
         return None
-    hits.append("Wave 3 is not the shortest actionary wave")
+    if actionary[1] <= shortest_limit:
+        misses.append("Wave 3 is borderline shortest within ratio buffer")
+        soft_penalty += 8
+    else:
+        hits.append("Wave 3 is not the shortest actionary wave")
 
-    if direction * (prices[4] - prices[1]) <= 0:
+    wave4_overlap_distance = direction * (prices[4] - prices[1])
+    if wave4_overlap_distance <= -buffer:
         misses.append("Wave 4 overlaps wave 1 territory")
         return None
-    hits.append("Wave 4 avoids wave 1 territory")
+    if wave4_overlap_distance <= 0:
+        misses.append("Wave 4 marginally overlaps wave 1 territory within buffer")
+        soft_penalty += 6
+    else:
+        hits.append("Wave 4 avoids wave 1 territory")
 
     truncated = direction * (prices[5] - prices[3]) <= 0
     if truncated:
@@ -676,7 +753,7 @@ def validate_impulse(window: tuple[WavePivot, ...]) -> WaveCandidate | None:
     fib3_score, fib3 = nearest_fib_score(safe_div(w3, w1), FIB_EXTENSIONS, tolerance=0.28)
     fib5_score, fib5 = nearest_fib_score(safe_div(w5, w1), FIB_EXTENSIONS, tolerance=0.28)
 
-    score = 62 + 8 * fib2_score + 7 * fib4_score + 7 * fib3_score + 5 * fib5_score
+    score = 62 + 8 * fib2_score + 7 * fib4_score + 7 * fib3_score + 5 * fib5_score - soft_penalty
     if extension:
         score += 5
     if truncated:
@@ -928,10 +1005,10 @@ def generate_wave_candidates(pivots: list[WavePivot]) -> list[WaveCandidate]:
     if len(pivots) < 4:
         return []
     candidates: list[WaveCandidate] = []
-    recent = pivots[-min(len(pivots), 24) :]
+    scan = pivots[-min(len(pivots), MAX_PIVOTS) :]
 
-    for i in range(0, max(0, len(recent) - 5)):
-        window = tuple(recent[i : i + 6])
+    for i in range(0, max(0, len(scan) - 5)):
+        window = tuple(scan[i : i + 6])
         impulse = validate_impulse(window)
         if impulse is not None:
             candidates.append(impulse)
@@ -939,21 +1016,21 @@ def generate_wave_candidates(pivots: list[WavePivot]) -> list[WaveCandidate]:
         if diagonal is not None:
             candidates.append(diagonal)
 
-    for i in range(0, max(0, len(recent) - 3)):
-        candidates.extend(validate_abc(tuple(recent[i : i + 4])))
+    for i in range(0, max(0, len(scan) - 3)):
+        candidates.extend(validate_abc(tuple(scan[i : i + 4])))
 
-    for i in range(0, max(0, len(recent) - 5)):
-        triangle = validate_triangle(tuple(recent[i : i + 6]))
+    for i in range(0, max(0, len(scan) - 5)):
+        triangle = validate_triangle(tuple(scan[i : i + 6]))
         if triangle is not None:
             candidates.append(triangle)
 
-    for i in range(0, max(0, len(recent) - 7)):
-        combo = validate_combination(tuple(recent[i : i + 8]), triple=False)
+    for i in range(0, max(0, len(scan) - 7)):
+        combo = validate_combination(tuple(scan[i : i + 8]), triple=False)
         if combo is not None:
             candidates.append(combo)
 
-    for i in range(0, max(0, len(recent) - 9)):
-        combo = validate_combination(tuple(recent[i : i + 10]), triple=True)
+    for i in range(0, max(0, len(scan) - 9)):
+        combo = validate_combination(tuple(scan[i : i + 10]), triple=True)
         if combo is not None:
             candidates.append(combo)
 
@@ -1073,6 +1150,223 @@ def wave_family(pattern: str) -> str:
     return pattern
 
 
+def is_motive_candidate(candidate: WaveCandidate) -> bool:
+    return "Impulse" in candidate.pattern or "Diagonal" in candidate.pattern
+
+
+def current_price_buffer(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
+    current = abs(float(df["Close"].iloc[-1]))
+    atr_last = df["ATR14"].iloc[-1] if "ATR14" in df else np.nan
+    atr_buffer = float(atr_last) * DEFAULT_ATR_MULTIPLE if pd.notna(atr_last) else 0.0
+    return max(current * TARGET_OVERSHOOT_BUFFER_PCT, atr_buffer, 1e-9)
+
+
+def target_overshoot_pct(current: float, candidate: WaveCandidate) -> float:
+    if candidate.target is None or pd.isna(candidate.target):
+        return 0.0
+    overshoot = directional_move(candidate.direction, candidate.target, current)
+    if overshoot <= 0:
+        return 0.0
+    return safe_div(overshoot, abs(float(candidate.target))) * 100
+
+
+def projected_motive_target_zone(candidate: WaveCandidate, current: float) -> tuple[float | None, float | None]:
+    prices = pivot_prices(candidate.pivots)
+    sign = direction_sign(candidate.direction)
+    if len(prices) < 6 or sign == 0:
+        return projected_simple_target_zone(candidate, current)
+
+    w1 = abs(prices[1] - prices[0])
+    w3 = abs(prices[3] - prices[2])
+    base = max(w1, w3, 1e-9)
+    anchor = prices[4]
+    levels = [0.618, 1.0, 1.272, 1.618, 2.0, 2.618, 3.618, 4.236]
+    projections = [anchor + sign * base * level for level in levels]
+    projections = sorted(projections, key=lambda level: directional_move(sign, anchor, level))
+    ahead = [level for level in projections if directional_move(sign, current, level) > 0]
+    if ahead:
+        high = ahead[1] if len(ahead) > 1 else ahead[0]
+        return sorted_price_zone(ahead[0], high)
+    if len(projections) >= 2:
+        return sorted_price_zone(projections[-2], projections[-1])
+    return projected_simple_target_zone(candidate, current)
+
+
+def projected_simple_target_zone(candidate: WaveCandidate, current: float) -> tuple[float | None, float | None]:
+    if candidate.target is None or pd.isna(candidate.target):
+        return None, None
+    width = max(abs(float(candidate.target)) * 0.025, abs(float(candidate.target) - current) * 0.08, 1e-9)
+    return sorted_price_zone(float(candidate.target) - width, float(candidate.target) + width)
+
+
+def annotate_candidate_forecast(df: pd.DataFrame, candidate: WaveCandidate) -> None:
+    if df.empty:
+        return
+    current = float(df["Close"].iloc[-1])
+    sign = direction_sign(candidate.direction)
+    buffer = current_price_buffer(df)
+    target_ahead = candidate.target is not None and directional_move(sign, current, candidate.target) > buffer
+    overshoot = candidate.target is not None and directional_move(sign, candidate.target, current) > buffer
+    overshoot_text = f"{target_overshoot_pct(current, candidate):.1f}%"
+    candidate.target_zone = projected_motive_target_zone(candidate, current) if is_motive_candidate(candidate) else projected_simple_target_zone(candidate, current)
+
+    if is_motive_candidate(candidate):
+        prices = pivot_prices(candidate.pivots)
+        last_swing = abs(prices[-1] - prices[-2]) if len(prices) >= 2 else 0.0
+        retrace_from_last = -directional_move(sign, prices[-1], current) if sign else 0.0
+        if overshoot:
+            candidate.status = f"기존 목표 {overshoot_text} 초과 - 1-5파 재카운트 필요"
+            candidate.current_wave = "5파 연장 또는 상위 3파 진행 후보"
+            zone_text = format_zone(candidate.target_zone)
+            if zone_text != "-" and directional_move(sign, current, candidate.target_zone[1] if sign > 0 else candidate.target_zone[0]) > 0:
+                candidate.next_wave = f"{zone_text} 확장 구간 확인 후, 실패 시 ABC 조정 후보"
+            else:
+                candidate.next_wave = "표준 확장 목표도 초과한 상태라 더 큰 상위 파동으로 재분석"
+        elif retrace_from_last > max(last_swing * 0.382, buffer):
+            candidate.status = "5파 완료 후 조정 진행 후보"
+            candidate.current_wave = "A파 조정 또는 4파성 되돌림 후보"
+            candidate.next_wave = "B파 반등 뒤 C파 완료 여부, 또는 새 1파 전환 확인"
+        elif target_ahead:
+            candidate.status = "5파 진행 후보"
+            candidate.current_wave = "5파 진행 중"
+            candidate.next_wave = f"1차 목표 {format_price(candidate.target)} 도달 후 5파 연장 또는 ABC 조정 전환 확인"
+        else:
+            candidate.status = "목표권 접근 - 연장 여부 확인"
+            candidate.current_wave = "5파 후반 또는 연장 초기 후보"
+            candidate.next_wave = "거래량/다이버전스 약화 시 ABC 조정, 강하면 다음 확장 목표 확인"
+        return
+
+    if "ABC" in candidate.pattern or "Zigzag" in candidate.pattern or "Flat" in candidate.pattern:
+        if overshoot:
+            candidate.status = f"조정 목표 {overshoot_text} 초과 - C파 연장/복합 조정 재검토"
+            candidate.current_wave = "C파 연장 또는 W-X-Y 확장 후보"
+            candidate.next_wave = "조정 완료 신호가 나오면 반대 방향 1파 후보 확인"
+        elif target_ahead:
+            candidate.status = "C파 목표 진행 후보"
+            candidate.current_wave = "C파 진행 중"
+            candidate.next_wave = "목표권 도달 후 반대 방향 1파 또는 복합 조정 전환 확인"
+        else:
+            candidate.status = "조정 목표권 접근"
+            candidate.current_wave = "C파 후반 후보"
+            candidate.next_wave = "반대 방향 1파 전환 여부 확인"
+        return
+
+    if "Triangle" in candidate.pattern:
+        candidate.status = "삼각 조정 후 돌파 대기"
+        candidate.current_wave = "E파 또는 돌파 초기 후보"
+        candidate.next_wave = f"{direction_ko(candidate.direction)} 돌파 시 1파 시작, 실패 시 삼각 조정 연장"
+        return
+
+    candidate.status = "복합 조정 후보"
+    candidate.current_wave = "W-X-Y 계열 조정 진행"
+    candidate.next_wave = "박스권 이탈 방향의 새 1파 또는 추가 X/Z파 확인"
+
+
+def score_pattern_priority(candidate: WaveCandidate) -> tuple[float, list[str]]:
+    if "Impulse" in candidate.pattern:
+        return 10.0, ["1-5 충격파 우선"]
+    if "Diagonal" in candidate.pattern:
+        return 3.0, ["5파 다이애고널 보조 후보"]
+    if "ABC" in candidate.pattern or "Zigzag" in candidate.pattern or "Flat" in candidate.pattern:
+        return -5.0, ["ABC 조정은 보조 후보로 감점"]
+    if "Triangle" in candidate.pattern or "W-X-Y" in candidate.pattern or "Triple Three" in candidate.pattern:
+        return -8.0, ["복합/삼각 조정은 보조 후보로 감점"]
+    return 0.0, []
+
+
+def score_current_position(df: pd.DataFrame, candidate: WaveCandidate) -> tuple[float, list[str]]:
+    if df.empty:
+        return 0.0, []
+    annotate_candidate_forecast(df, candidate)
+    current = float(df["Close"].iloc[-1])
+    sign = direction_sign(candidate.direction)
+    buffer = current_price_buffer(df)
+    bonus = 0.0
+    notes: list[str] = []
+
+    if candidate.status:
+        notes.append(candidate.status)
+
+    if candidate.target is not None and directional_move(sign, candidate.target, current) > buffer:
+        overshoot_pct = target_overshoot_pct(current, candidate)
+        if overshoot_pct >= TARGET_EXTREME_OVERSHOOT_PCT * 100:
+            penalty = 34
+        elif overshoot_pct >= TARGET_MAJOR_OVERSHOOT_PCT * 100:
+            penalty = 26
+        elif overshoot_pct >= 10:
+            penalty = 16
+        else:
+            penalty = 8
+        if not is_motive_candidate(candidate):
+            penalty += 6
+        bonus -= penalty
+        notes.append(f"목표 초과 {overshoot_pct:.1f}%: 기존 카운트 신뢰도 감점")
+
+    if candidate.invalidation is not None and directional_move(sign, candidate.invalidation, current) < -buffer:
+        bonus -= 38
+        notes.append("무효화선 이탈/돌파로 기존 카운트 약화")
+
+    bars_since = len(df) - 1 - candidate.pivots[-1].index
+    if bars_since <= 5:
+        bonus += 5
+        notes.append("현재가가 최신 피벗 근처")
+    elif bars_since <= 20:
+        bonus += 2
+        notes.append("최근 피벗 기반")
+    elif bars_since > 500:
+        bonus -= 18
+        notes.append("피벗이 너무 오래되어 재카운트 필요")
+    elif bars_since > 250:
+        bonus -= 12
+        notes.append("최근 가격과 피벗 거리 큼")
+    elif bars_since > 120:
+        bonus -= 7
+        notes.append("최근 파동과 거리 있음")
+
+    if candidate.target is not None:
+        remaining = directional_move(sign, current, candidate.target)
+        if remaining > 0:
+            remaining_pct = safe_div(remaining, current)
+            if 0.03 <= remaining_pct <= 0.30:
+                bonus += 3
+                notes.append("목표까지 남은 폭이 현실적")
+            elif remaining_pct > 0.80:
+                bonus -= 5
+                notes.append("목표까지 남은 폭이 과도함")
+
+    return clamp(bonus, -48, 10), notes
+
+
+def cap_score_for_current_position(df: pd.DataFrame, candidate: WaveCandidate, score: float) -> tuple[float, list[str]]:
+    if df.empty:
+        return score, []
+    current = float(df["Close"].iloc[-1])
+    sign = direction_sign(candidate.direction)
+    buffer = current_price_buffer(df)
+    notes: list[str] = []
+    cap = 100.0
+
+    if candidate.target is not None and directional_move(sign, candidate.target, current) > buffer:
+        overshoot_pct = target_overshoot_pct(current, candidate)
+        if overshoot_pct >= TARGET_EXTREME_OVERSHOOT_PCT * 100:
+            cap = 58.0 if is_motive_candidate(candidate) else 42.0
+        elif overshoot_pct >= TARGET_MAJOR_OVERSHOOT_PCT * 100:
+            cap = 66.0 if is_motive_candidate(candidate) else 50.0
+        elif overshoot_pct >= 10:
+            cap = 74.0 if is_motive_candidate(candidate) else 58.0
+        else:
+            cap = 82.0 if is_motive_candidate(candidate) else 68.0
+        notes.append(f"목표 초과 후보 점수 상한 {cap:.0f}% 적용")
+
+    if candidate.invalidation is not None and directional_move(sign, candidate.invalidation, current) < -buffer:
+        cap = min(cap, 35.0)
+        notes.append("무효화된 후보 점수 상한 35% 적용")
+
+    return min(score, cap), notes
+
+
 def score_trend_context(df: pd.DataFrame, candidate: WaveCandidate) -> tuple[float, list[str]]:
     if df.empty:
         return 0.0, []
@@ -1119,9 +1413,15 @@ def score_trend_context(df: pd.DataFrame, candidate: WaveCandidate) -> tuple[flo
             notes.append("이평선 수렴 후 방향 대기")
 
     duration = candidate.pivots[-1].index - candidate.pivots[0].index
-    if duration >= 180:
-        bonus += 8
+    if duration >= LONG_TERM_WAVE_BARS:
+        bonus += 18
+        notes.append("1000일 이상 장기 파동 구조")
+    elif duration >= 500:
+        bonus += 12
         notes.append("장기 파동 구조")
+    elif duration >= 180:
+        bonus += 7
+        notes.append("중장기 파동 구조")
     elif duration >= 90:
         bonus += 5
         notes.append("중기 이상 파동 구조")
@@ -1268,19 +1568,22 @@ def analyze_scenarios(
         trend_bonus, trend_notes = score_trend_context(indicators, candidate)
         convergence_bonus, convergence_notes = score_convergence_divergence(indicators, candidate)
         consensus_bonus, consensus_notes = score_candidate_consensus(candidate, all_candidates)
+        pattern_bonus, pattern_notes = score_pattern_priority(candidate)
+        position_bonus, position_notes = score_current_position(indicators, candidate)
         recency_bonus = 0.0
         last_idx = candidate.pivots[-1].index
         bars_since = len(df) - 1 - last_idx
         if bars_since <= 5:
-            recency_bonus = 8
-        elif bars_since <= 20:
             recency_bonus = 4
+        elif bars_since <= 20:
+            recency_bonus = 2
         elif bars_since > 120:
-            recency_bonus = -8
-            notes.append("최근 파동과 거리 있음")
-        evidence_bonus = indicator_bonus + trend_bonus + convergence_bonus + consensus_bonus + recency_bonus
+            recency_bonus = -4
+        evidence_bonus = indicator_bonus + trend_bonus + convergence_bonus + consensus_bonus + pattern_bonus + position_bonus + recency_bonus
         final_score = clamp(candidate.score_raw * 0.70 + evidence_bonus * 0.40 + 8.0, 0, 100)
-        evidence_notes = [*notes, *trend_notes, *convergence_notes, *consensus_notes]
+        final_score, cap_notes = cap_score_for_current_position(indicators, candidate, final_score)
+        evidence_notes = [*position_notes, *pattern_notes, *notes, *trend_notes, *convergence_notes, *consensus_notes]
+        evidence_notes.extend(cap_notes)
         enriched.append((candidate, evidence_bonus, evidence_notes, final_score))
 
     enriched = sorted(enriched, key=lambda item: item[3], reverse=True)[:TOP_SCENARIOS]
@@ -1307,6 +1610,8 @@ def analyze_ticker(ticker: str, df: pd.DataFrame) -> TickerAnalysis:
     errors: list[str] = []
     if len(df) < 80:
         errors.append("At least 80 daily bars are recommended for wave analysis.")
+    elif len(df) < LONG_TERM_WAVE_BARS:
+        errors.append("장기 Elliott 파동은 1000개 이상 일봉을 권장합니다. 현재 데이터는 장기 카운트 신뢰도가 낮을 수 있습니다.")
     indicators = compute_indicators(df)
     pivots, scenarios = analyze_scenarios(df)
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -1395,14 +1700,17 @@ def run_walk_forward_backtest(
         scored: list[ScenarioScore] = []
         total = 0.0
         tmp: list[tuple[WaveCandidate, float, list[str], float]] = []
-        for candidate in candidates[:10]:
+        for candidate in candidates[:24]:
             if pattern_filter != "All" and pattern_filter not in candidate.pattern:
                 continue
             bonus, notes = score_indicator_alignment(indicators, candidate)
-            final_score = clamp(candidate.score_raw + bonus, 0, 100)
+            pattern_bonus, pattern_notes = score_pattern_priority(candidate)
+            position_bonus, position_notes = score_current_position(indicators, candidate)
+            final_score = clamp(candidate.score_raw + bonus + pattern_bonus + position_bonus, 0, 100)
+            final_score, cap_notes = cap_score_for_current_position(indicators, candidate, final_score)
             if final_score < min_confidence:
                 continue
-            tmp.append((candidate, bonus, notes, final_score))
+            tmp.append((candidate, bonus + pattern_bonus + position_bonus, [*position_notes, *pattern_notes, *notes, *cap_notes], final_score))
             total += max(final_score, 1)
         for candidate, bonus, notes, final_score in tmp:
             scored.append(ScenarioScore(candidate, max(final_score, 1) / total * 100 if total else 0, bonus, notes, final_score))
@@ -1492,6 +1800,22 @@ def make_pivots_from_points(points: list[float]) -> tuple[WavePivot, ...]:
     return tuple(pivots)
 
 
+def make_pivots_from_indexed_points(points: list[tuple[int, float]]) -> tuple[WavePivot, ...]:
+    if not points:
+        return tuple()
+    max_index = max(index for index, _ in points)
+    dates = pd.date_range("2016-01-01", periods=max_index + 1, freq="B")
+    pivots: list[WavePivot] = []
+    prices = [price for _, price in points]
+    for pos, (index, price) in enumerate(points):
+        if pos == 0:
+            kind = "L" if len(prices) == 1 or prices[1] > price else "H"
+        else:
+            kind = "H" if price > prices[pos - 1] else "L"
+        pivots.append(WavePivot(index, pd.Timestamp(dates[index]), float(price), kind))
+    return tuple(pivots)
+
+
 def run_rule_unit_tests() -> pd.DataFrame:
     tests: list[dict[str, object]] = []
 
@@ -1531,6 +1855,67 @@ def run_rule_unit_tests() -> pd.DataFrame:
     invalid_overlap = validate_impulse(make_pivots_from_points([100, 120, 110, 145, 118, 160]))
     record("Invalid impulse: W4 overlap", invalid_overlap is None, "Rejected" if invalid_overlap is None else invalid_overlap.pattern)
 
+    buffered_w2 = validate_impulse(make_pivots_from_points([100, 120, 98.8, 150, 136, 165]))
+    record(
+        "Impulse buffer: marginal W2 breach",
+        buffered_w2 is not None and any("buffer" in miss for miss in buffered_w2.rule_misses),
+        "; ".join(buffered_w2.rule_misses) if buffered_w2 else "Rejected",
+    )
+
+    buffered_w4 = validate_impulse(make_pivots_from_points([100, 120, 110, 150, 119.2, 166]))
+    record(
+        "Impulse buffer: marginal W4 overlap",
+        buffered_w4 is not None and any("buffer" in miss for miss in buffered_w4.rule_misses),
+        "; ".join(buffered_w4.rule_misses) if buffered_w4 else "Rejected",
+    )
+
+    overshot = validate_impulse(make_pivots_from_points([100, 120, 110, 150, 135, 162]))
+    overshot_frame = synthetic_ohlcv([100, 120, 110, 150, 135, 162, 245], bars_per_segment=5)
+    if overshot is not None:
+        overshot_indicators = compute_indicators(overshot_frame)
+        position_score, position_notes = score_current_position(overshot_indicators, overshot)
+        record(
+            "Target overshoot triggers recount",
+            position_score <= -24 and "재카운트" in overshot.status and "연장" in overshot.current_wave,
+            f"{overshot.status}; score {position_score:.1f}; {', '.join(position_notes[:2])}",
+        )
+        record(
+            "Future wave forecast populated",
+            bool(overshot.next_wave),
+            overshot.next_wave or "No forecast",
+        )
+        capped_score, cap_notes = cap_score_for_current_position(overshot_indicators, overshot, 95.0)
+        record(
+            "Target overshoot caps confidence",
+            capped_score <= 58 and bool(cap_notes),
+            f"capped {capped_score:.1f}; {', '.join(cap_notes)}",
+        )
+    else:
+        record("Target overshoot triggers recount", False, "No impulse")
+        record("Future wave forecast populated", False, "No impulse")
+        record("Target overshoot caps confidence", False, "No impulse")
+
+    old_valid_points = [(0, 100), (220, 120), (430, 110), (700, 150), (940, 135), (1220, 162)]
+    trailing_points = [(1240 + idx * 8, 160 + (6 if idx % 2 == 0 else -6)) for idx in range(30)]
+    long_scan = generate_wave_candidates(list(make_pivots_from_indexed_points([*old_valid_points, *trailing_points])))
+    record(
+        "Long-term scan keeps older 1-5",
+        any("Impulse" in item.pattern and item.pivots[0].index == 0 for item in long_scan),
+        ", ".join(f"{item.pattern}@{item.pivots[0].index}" for item in long_scan[:6]) or "No candidates",
+    )
+
+    long_candidate = validate_impulse(make_pivots_from_indexed_points(old_valid_points))
+    long_frame = synthetic_ohlcv([100, 120, 110, 150, 135, 162], bars_per_segment=260)
+    if long_candidate is not None:
+        _, long_notes = score_trend_context(compute_indicators(long_frame), long_candidate)
+        record(
+            "Long-term context rewards 1000 bars",
+            any("1000일" in note for note in long_notes),
+            ", ".join(long_notes) or "No notes",
+        )
+    else:
+        record("Long-term context rewards 1000 bars", False, "No impulse")
+
     for name, points, expected in [
         ("Synthetic impulse pipeline", [100, 120, 110, 150, 135, 162], "Impulse"),
         ("Synthetic diagonal pipeline", [100, 120, 112, 130, 118, 134], "Diagonal"),
@@ -1562,6 +1947,10 @@ def scenario_table(scenarios: list[ScenarioScore]) -> pd.DataFrame:
                 "근거 점수 %": round(scenario.confidence_pct, 1),
                 "후보 내 비중 %": round(scenario.relative_weight_pct, 1),
                 "근거 보너스": round(scenario.indicator_bonus, 1),
+                "상태": candidate.status or "-",
+                "현재 파동": candidate.current_wave or "-",
+                "다음 예상": candidate.next_wave or "-",
+                "목표 구간": format_zone(candidate.target_zone),
                 "Extension": candidate.extension or "-",
                 "Alternation": candidate.alternation or "-",
                 "Target": candidate.target,
@@ -1611,7 +2000,8 @@ def auto_zoom_range(plot_df: pd.DataFrame, selected_scenario: ScenarioScore | No
                     values.append(float(pivot_value))
         current = float(plot_df["Close"].iloc[-1])
         base_span = max(abs(values[1] - values[0]), 1e-9)
-        for raw_level in [selected_scenario.candidate.target, selected_scenario.candidate.invalidation]:
+        zone_low, zone_high = selected_scenario.candidate.target_zone
+        for raw_level in [selected_scenario.candidate.target, selected_scenario.candidate.invalidation, zone_low, zone_high]:
             level = transform(raw_level)
             if level is not None and abs(float(level) - current) <= base_span * (2.2 if percent_mode else 1.6):
                 values.append(float(level))
@@ -1705,6 +2095,18 @@ def make_wave_chart(
         if target_y is not None:
             fig.add_hline(y=target_y, line_width=1.4, line_dash="dash", line_color="#2e7d32", row=1, col=1)
             fig.add_annotation(xref="paper", x=0.0, y=target_y, text="목표가", showarrow=False, font=dict(color="#2e7d32"), row=1, col=1)
+        zone_low, zone_high = candidate.target_zone
+        zone_y0 = transform(zone_low)
+        zone_y1 = transform(zone_high)
+        if zone_y0 is not None and zone_y1 is not None and abs(float(zone_y1) - float(zone_y0)) > 1e-9:
+            fig.add_hrect(
+                y0=min(zone_y0, zone_y1),
+                y1=max(zone_y0, zone_y1),
+                line_width=0,
+                fillcolor="rgba(46, 125, 50, 0.10)",
+                row=1,
+                col=1,
+            )
         invalid_y = transform(candidate.invalidation)
         if invalid_y is not None:
             fig.add_hline(y=invalid_y, line_width=1.4, line_dash="dash", line_color="#c62828", row=1, col=1)
@@ -1769,6 +2171,7 @@ def render_korean_guide(analysis: TickerAnalysis, scenario: ScenarioScore) -> No
         m2.metric(upside_label, format_price(candidate.target), f"{move_pct:.1f}%" if move_pct is not None else None)
         m3.metric("무효화 가격", format_price(candidate.invalidation))
         m4.metric("방향", direction_ko(candidate.direction))
+        st.write({"상태": candidate.status or "-", "목표 구간": format_zone(candidate.target_zone)})
         st.markdown(
             "\n".join(
                 [
@@ -1776,6 +2179,7 @@ def render_korean_guide(analysis: TickerAnalysis, scenario: ScenarioScore) -> No
                     f"- {guide['risk']}",
                     f"- {guide['wave']}",
                     f"- {guide['extension']}",
+                    f"- {guide['forecast']}",
                     f"- {guide['indicator']}",
                 ]
             )
@@ -1826,7 +2230,11 @@ def render_analysis_tab(analysis: TickerAnalysis) -> ScenarioScore | None:
                 "원본 패턴": selected.candidate.pattern,
                 "방향": direction_ko(selected.candidate.direction),
                 "라벨": " -> ".join(selected.candidate.labels),
+                "상태": selected.candidate.status or None,
+                "현재 파동": selected.candidate.current_wave or None,
+                "다음 예상": selected.candidate.next_wave or None,
                 "목표가": selected.candidate.target,
+                "목표 구간": format_zone(selected.candidate.target_zone),
                 "무효화": selected.candidate.invalidation,
                 "연장": selected.candidate.extension or None,
                 "교대 법칙": selected.candidate.alternation or None,
@@ -1985,7 +2393,9 @@ def main() -> None:
                 f"종합 확률 {selected_scenario.probability_pct:.1f}% | "
                 f"예상 이동폭 {move_text} | "
                 f"목표 {format_price(selected_scenario.candidate.target)} | "
-                f"무효화 {format_price(selected_scenario.candidate.invalidation)}"
+                f"목표 구간 {format_zone(selected_scenario.candidate.target_zone)} | "
+                f"무효화 {format_price(selected_scenario.candidate.invalidation)} | "
+                f"{selected_scenario.candidate.current_wave or selected_scenario.candidate.status}"
             )
 
     with tab_backtest:
